@@ -1,0 +1,633 @@
+---
+title: "Soybean Contract Dashboard"
+resource_files:
+# - minne.sqlite
+runtime: shiny
+output: flexdashboard::flex_dashboard
+---
+
+```{r global, include = FALSE}
+library(shinyauthr)
+library(shinyWidgets)
+library(shinyBS)
+library(png)
+library(grid)
+library(RSQLite)
+library(shinydashboard)
+library(glue)
+library(openxlsx)
+library(imputeTS)
+library(forecast)
+library(data.table)
+library(readxl)
+library(png)
+library(raster)
+library(quantmod)
+library(TTR)
+
+sql_db_file <- "minne.sqlite"
+mydb <- dbConnect(RSQLite::SQLite(), sql_db_file)
+
+group_diff <- function(df){
+   tmp <- apply(df[-c(1:8)], MARGIN = 2, FUN = function(x) diff(x))
+   return(tmp)
+}
+
+plt <- function(df1_progress, df2_contracts, contract_name = "March") {
+  date_1 <- df1_progress$WEEK.ENDING - 2
+  date_2 <- df1_progress$WEEK.ENDING + 2
+  price_1 <- df2_contracts[df2_contracts$Date %in% date_1, ]
+  price_2 <- df2_contracts[df2_contracts$Date %in% date_2, ]
+  tabl = df1_progress
+  par(mar = c(5,5,2,5))
+  plot(tabl$WEEK.ENDING,tabl$PROGRESS.in.PCT.PLANTED,type="l",col="red",
+       lwd = 2, xlab = 'Timeline', ylab = 'Progress(%)')
+  text = c('Planted', 'Emerged', 'Blooming', 'SettingPods', 'DroppingLeaves',
+           'Harvested')
+  color = c('red','green','darkgreen','purple','brown','gold')
+  legend("bottomleft", legend = text,# text.width = strwidth(text)[5]/100,
+         col = color,lty = 1, bty= "n",
+         cex = 0.76, seg.len=0.4, text.col = color)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..5.YEAR.AVG.in.PCT.PLANTED,
+        lty = 2,col="red", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..PREVIOUS.YEAR.in.PCT.PLANTED,
+        lty = 3,col="red", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS.in.PCT.EMERGED,col="green", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..5.YEAR.AVG.in.PCT.EMERGED,
+        lty = 2,col="green", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..PREVIOUS.YEAR.in.PCT.EMERGED,
+        lty = 3,col="green", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS.in.PCT.BLOOMING,col="darkgreen", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..5.YEAR.AVG.in.PCT.BLOOMING,
+        lty = 2,col="darkgreen", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..PREVIOUS.YEAR.in.PCT.BLOOMING,
+        lty = 3, col="darkgreen", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS.in.PCT.SETTING.PODS,col="purple")
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..5.YEAR.AVG.in.PCT.SETTING.PODS,
+        lty = 2,col="purple", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..PREVIOUS.YEAR.in.PCT.SETTING.PODS,
+        lty = 3, col="purple", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS.in.PCT.DROPPING.LEAVES,col="brown")
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..5.YEAR.AVG.in.PCT.DROPPING.LEAVES,
+        lty = 2,col="brown", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..PREVIOUS.YEAR.in.PCT.DROPPING.LEAVES,
+        lty = 3, col="brown", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS.in.PCT.HARVESTED,col="gold")
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..5.YEAR.AVG.in.PCT.HARVESTED, lty = 2,
+        col="gold", lwd = 2)
+  lines(tabl$WEEK.ENDING,tabl$PROGRESS..PREVIOUS.YEAR.in.PCT.HARVESTED, lty = 3,
+        col="gold", lwd = 2)
+  par(new = T)
+  plot(price_1$Date, price_1$Close, pch=16, axes = F , type = 'b',
+       xlim = range(tabl$WEEK.ENDING), ylim = range(price_1$Open),
+       xlab=NA, ylab=NA, col = 'grey')
+  lines(price_2$Date, price_2$Close, pch=16, axes = F, type = 'b',
+        xlim = range(tabl$WEEK.ENDING), ylim = range(price_2$Open),
+        xlab=NA, ylab=NA)
+  mtext(side = 4, line = 3, 'Contract price')
+  axis(side = 4) #add a right axis
+  text = c('before', 'after')
+  legend('topleft', legend = text, lwd = 1, col = c('grey','black'),
+         #text.width = strwidth(text)[1]/10, 
+         pch = 19, cex = 0.9, seg.len=0.5)
+  title(paste0("Crop_progress & ", contract_name, " Contracts"))
+}
+
+if (!dbExistsTable(conn = mydb, name = "user_base")) {
+  dbGetQuery(
+    mydb,
+    "CREATE TABLE user_base (user varchar(64), password_hash varchar(101), permissions varchar(9), name varchar(64), PRIMARY KEY(user));"
+  )
+}
+
+user_base <- dbGetQuery(mydb, "SELECT * FROM user_base;")
+dbDisconnect(mydb)
+options1 <-
+  list(
+    "July" = "ActiveSoybeanContractsforJuly2020.CSV.xlsx",
+    "March" = "ActiveSoybeanContractsForMarch2020.CSV.xlsx",
+    "May" = "ActiveSoybeanContractsForMay2020.CSV.xlsx"
+  )
+options2 <- list("Open", "High", "Low", "Close")
+reports <- c("Crop Progress", "WASDE", "Other")
+tech <- c("RSI", "BBands", "EMA", "DEMA", "SMA", "SAR")
+```
+
+```{r}
+shinyApp(
+  ui = dashboardPage(
+    dashboardHeader(
+      title = "Soybean Contracts Dashboard",
+      tags$li(
+        class = "dropdown",
+        style = "padding: 8px;",
+        shinyauthr::logoutUI("logout")
+      )
+    ),
+    
+    dashboardSidebar(
+      collapsed = T,
+      div(textOutput("welcome"), style = "padding: 20px"),
+      div(uiOutput("price_period")),
+      div(uiOutput("price_type")),
+      div(uiOutput("selectedMonth")),
+      div(uiOutput("TAs"))
+    ),
+    
+    dashboardBody(
+      shinyjs::useShinyjs(),
+      uiOutput("login_page"),
+      uiOutput("dashboard")
+    )
+  ),
+  
+  server = function(input, output) {
+    logout_init <-
+      callModule(module = shinyauthr::logout,
+                 id = "logout",
+                 reactive(credentials()$user_auth))
+    
+    credentials <- callModule(
+      module = shinyauthr::login,
+      id = "login",
+      data = user_base,
+      user_col = user,
+      pwd_col = password_hash,
+      sodium_hashed = TRUE,
+      log_out = reactive(logout_init())
+    )
+    
+    observe({
+      if (credentials()$user_auth) {
+        shinyjs::removeClass(selector = "body", class = "sidebar-collapse")
+      } else {
+        shinyjs::addClass(selector = "body", class = "sidebar-collapse")
+      }
+    })
+    
+    output$selectedMonth <- renderUI({
+      if (credentials()$user_auth) {
+        if(input$tab == "Stock Analysis") {
+          return(selectInput(inputId = "selected_month",
+                             label = "Select contract type:",
+                             choices = options1))
+        }
+      }
+    })
+    
+    output$TAs <- renderUI({
+      if (credentials()$user_auth) {
+        if(input$tab == "Stock Analysis") {
+          return(checkboxGroupInput(inputId = "TA",
+                                    label = "Select technical indicators to plot:",
+                                    choices = tech,
+                                    selected = tech))
+        }
+      }
+    })
+    
+    output$price_type <- renderUI({
+      if (credentials()$user_auth) {
+        if(input$tab == "Time Series Analysis") {
+          return(
+            selectInput(
+              inputId = "price_type",
+              label = "Select type of price:",
+              choices = options2,
+              selected = options2[1]
+            )
+          )
+        }
+      }
+    })
+    
+    output$price_period <- renderUI({
+      if (credentials()$user_auth) {
+        if(input$tab == "Time Series Analysis") {
+          return(
+            selectInput(
+              inputId = "price_period",
+              label = "Select contract period:",
+              choices = options1,
+              selected = options1[1]
+            )
+          )
+        }
+      }
+    })
+    
+    observeEvent(input$signup, {
+      if (input$user == "") {
+        output$error <-
+          renderText(return(
+            '<font color = "red"><b>Username cannot be blank!<b></font>'
+          ))
+      }
+      if (input$password == "") {
+        output$error <-
+          renderText(return(
+            '<font color = "red"><b>Password cannot be blank!<b></font>'
+          ))
+      }
+      if (input$name == "") {
+        output$error <-
+          renderText(return('<font color = "red"><b>Name cannot be empty!<b></font>'))
+      }
+      if (input$name != "" &
+          input$password != "" & input$user != "") {
+        mydb <- dbConnect(RSQLite::SQLite(), sql_db_file)
+        user_base <- dbGetQuery(mydb, "SELECT * FROM user_base;")
+        dbDisconnect(mydb)
+        if (input$user %in% user_base$user) {
+          output$error <-
+            renderText(return(
+              '<font color = "red"><b>Username already exists. Please enter a differnet username!<b></font>'
+            ))
+        } else {
+          passwd_hsh <- sodium::password_store(input$password)
+          insert_query <-
+            paste0(
+              "INSERT INTO user_base VALUES('",
+              input$user,
+              "', '",
+              passwd_hsh,
+              "', '",
+              input$permissions,
+              "', '",
+              input$name,
+              "');"
+            )
+          mydb <- dbConnect(RSQLite::SQLite(), sql_db_file)
+          dbGetQuery(mydb, insert_query)
+          dbDisconnect(mydb)
+          output$error <-
+            renderText(return(
+              '<font color = "green"><b>Signup successful! Please refresh the page before attempting to login<b></font>'
+            ))
+        }
+      }
+      mydb <- dbConnect(RSQLite::SQLite(), sql_db_file)
+      user_base <<- dbGetQuery(mydb, "SELECT * FROM user_base;")
+      dbDisconnect(mydb)
+    })
+    
+    user_info <- reactive({
+      return(credentials()$info)
+    })
+    
+    output$welcome <- renderText({
+      req(credentials()$user_auth)
+      return(glue("Welcome {user_info()$name}"))
+    })
+    
+    output$dashboard <- renderUI({
+      req(credentials()$user_auth)
+      return(
+        tabsetPanel(id = "tab",
+          tabPanel("Time Series Analysis",
+                   fluidPage(
+                     fluidRow(
+                       uiOutput("time_series_exploration"),
+                       uiOutput("arima_vis"),
+                       uiOutput("arima_diag")
+                   )
+                 )
+          ),
+          tabPanel("Twitter Analysis",
+                   fluidPage(
+                     fluidRow(
+                       plotOutput("china_unprocessed")
+                     ),
+                     fluidRow(
+                       plotOutput("farmer_unprocessed")
+                     ),
+                     fluidRow(
+                       plotOutput("soybeans_unprocessed")
+                     ),
+                     fluidRow(
+                       plotOutput("china_processed")
+                     ),
+                     fluidRow(
+                       plotOutput("farmer_processed")
+                     ),
+                     fluidRow(
+                       plotOutput("soybeans_processed")
+                     )
+                   )
+          ),
+          tabPanel("Stock Analysis",
+                   fluidPage(
+                     fluidRow(
+                       plotOutput("stock_plot")
+                     )
+                   )
+          ),
+          tabPanel("Data Uploader",
+                   fluidPage(
+                     fluidRow(
+                       fileInput(
+                         "file1",
+                         "Choose File",
+                         multiple = FALSE,
+                         accept = c("text/csv",
+                                    "text/comma-separated-values,text/plain",
+                                    ".csv")
+                       )
+                     ),
+                     fluidRow(
+                       selectInput(
+                         inputId = "upload_file_type",
+                         label = "Choose type of file",
+                         choices = reports,
+                         selected = reports[1],
+                         multiple = FALSE
+                       )
+                     ),
+                     tabsetPanel(
+                       tabPanel(
+                         title = "Plots",
+                         fluidRow(
+                           plotOutput("plt1")
+                         ),
+                         fluidRow(
+                           plotOutput("plt2")
+                         ),
+                         fluidRow(
+                           plotOutput("plt3")
+                         )
+                       ),
+                       tabPanel(
+                         title = "Table",
+                         fluidRow(
+                           tableOutput("tbl")
+                         )
+                       )
+                     )
+                   )
+          )
+        )
+      )
+    })
+    
+    output$tbl <- renderTable({
+      req(input$file1)
+      return(head(crop_progress))
+    })
+    
+    output$china_processed <- renderPlot({
+      img <- readPNG("data/processed_China_wordcloud.png")
+      return(grid.raster(img))
+    })
+    
+    output$farmer_processed <- renderPlot({
+      img <- readPNG("data/processed_Farmer_wordcloud.png")
+      return(grid.raster(img))
+    })
+    
+    output$soybeans_processed <- renderPlot({
+      img <- readPNG("data/processed_soybeans_wordcloud.png")
+      return(grid.raster(img))
+    })
+    
+    output$china_unprocessed <- renderPlot({
+      img <- readPNG("data/unprocessed_China_wordcloud.png")
+      return(grid.raster(img))
+    })
+    
+    output$farmer_unprocessed <- renderPlot({
+      img <- readPNG("data/unprocessed_Farmer_wordcloud.png")
+      return(grid.raster(img))
+    })
+    
+    output$soybeans_unprocessed <- renderPlot({
+      img <- readPNG("data/unprocessed_soybeans_wordcloud.png")
+      return(grid.raster(img))
+    })
+    
+    process_crop_progress <- reactive({
+      crop_progress <- read.csv(file = input$file1$datapath,
+                                header = TRUE, sep = ',')
+      crop_progress$WEEK.ENDING <-
+        as.Date(crop_progress$WEEK.ENDING, "%Y-%m-%d")
+      crop_progress <<- crop_progress[-c(2:5,7)]
+      ContractsforJuly2020 <<-
+        read_excel(
+          "data/ActiveSoybeanContractsforJuly2020.CSV.xlsx",
+          skip = 3)
+      ContractsforMarch2020 <<-
+        read_excel(
+          "data/ActiveSoybeanContractsForMarch2020.CSV.xlsx",
+          skip = 3)
+      ContractsforMay2020 <<-
+        read_excel(
+          "data/ActiveSoybeanContractsForMay2020.CSV.xlsx",
+          skip = 3)
+      ContractsforJuly2020$Date <<-
+        as.Date(ContractsforJuly2020$Date, "%Y-%m-%d")
+      ContractsforMarch2020$Date <<-
+        as.Date(ContractsforMarch2020$Date, "%Y-%m-%d")
+      ContractsforMay2020$Date <<-
+        as.Date(ContractsforMay2020$Date, "%Y-%m-%d")
+      crop_progress_diff <<- group_diff(crop_progress)
+      return()
+    })
+    
+    output$plt1 <- renderPlot({
+      req(input$file1)
+      if(input$upload_file_type == "Crop Progress") {
+        tryCatch({
+          process_crop_progress()
+        },
+        error = function(e) {
+          stop(safeError(e))
+        }
+        )
+        return(plt(df1_progress = crop_progress,
+                   df2_contracts = ContractsforMarch2020,
+                   contract_name = "March"))
+      }
+    })
+    
+    output$plt2 <- renderPlot({
+      req(input$file1)
+      if(input$upload_file_type == "Crop Progress") {
+        return(plt(df1_progress = crop_progress,
+                   df2_contracts = ContractsforMay2020,
+                   contract_name = "May"))
+      }
+    })
+    
+    output$plt3 <- renderPlot({
+      req(input$file1)
+      if(input$upload_file_type == "Crop Progress") {
+        return(plt(df1_progress = crop_progress,
+                   df2_contracts = ContractsforJuly2020,
+                   contract_name = "July"))
+      }
+    })
+    
+    get_data <- reactive({
+      df <- read.xlsx(
+        paste0("data/", input$price_period),
+        sheet = 1,
+        startRow = 4,
+        detectDates = T
+      )
+      rws <- nrow(df)
+      df$color <- "black"
+      df$color[(rws - 29):rws] <- "red"
+      if (!is.null(input$date_slider)) {
+        min_max <- range(df$Date)
+        slider <- input$date_slider * (min_max[2] - min_max[1])
+        df$color[df$Date < (min_max[2] - slider)] <- "gray"
+      }
+      return(df)
+    })
+    
+    output$time_series_vis <- renderPlot({
+      df <- get_data()
+      return(plot(
+        x = df[, "Date"],
+        y = df[, input$price_type],
+        xlab = "Date",
+        ylab = paste(input$price_type, "price"),
+        col = df$color
+      ))
+    })
+    
+    output$sliderPanel <- renderUI({
+      return(fluidRow(column(
+        width = 10,
+        offset = 1,
+        noUiSliderInput(
+          inputId = "date_slider",
+          label = "Choose time window for building ARIMA model:",
+          min = 0,
+          max = 1,
+          step = 0.0001,
+          value = 1,
+          tooltips = FALSE,
+          width = "100%",
+          direction = "rtl"
+        )
+      )))
+    })
+    
+    output$time_series_exploration <- renderUI({
+      return(fluidRow(
+        panel(
+          heading = "Time series exploration",
+          status = "info",
+          plotOutput("time_series_vis"),
+          uiOutput("sliderPanel")
+        )
+      ))
+    })
+    
+    output$stock_plot <- renderPlot({
+      prices <- read_excel(paste0("data/", input$selected_month), skip = 3)
+      prices <- xts(prices[, -1], order.by = prices$Date, frequency = 5)
+      chartSeries(prices, theme = chartTheme('white'),
+                  TA = c(addRSI(n = 14, maType = "SMA"),
+                         addBBands(n = 14, maType = "SMA"),
+                         addEMA(n = 14),
+                         addDEMA(n = 14),
+                         addSMA(n = 14),
+                         addSAR()))
+      ta <- NULL
+      if("RSI" %in% input$TA) {
+        addRSI(n = 14, maType = "SMA")
+      }
+      
+      if("BBands" %in% input$TA) {
+        addBBands(n = 14, maType = "SMA")
+      }
+      
+      if("EMA" %in% input$TA) {
+        addEMA(n = 14)
+      }
+      
+      if("DEMA" %in% input$TA) {
+        addDEMA(n = 14)
+      }
+      
+      if("SMA" %in% input$TA) {
+        addSMA(n = 14)
+      }
+      
+      if("SAR" %in% input$TA) {
+        addSAR()
+      }
+    })
+    
+    output$login_page <- renderUI({
+      if (!credentials()$user_auth) {
+        return(tabBox(
+          tabPanel(
+            "Login",
+            shinyauthr::loginUI(id = "login",
+                                title = "Login to access soybean contracts dashboard")
+          ),
+          tabPanel("Signup",
+                   fluidPage(
+                     fluidRow(
+                       textInput(inputId = "user", label = "Username"),
+                       textInput(inputId = "name", "Name"),
+                       passwordInput(inputId = "password", label = "Password"),
+                       selectInput(
+                         inputId = "permissions",
+                         label = "Permissions",
+                         choices = c("admin", "standard"),
+                         selected = "standard"
+                       ),
+                       actionButton(
+                         inputId = "signup",
+                         label = "Signup",
+                         icon = icon("user-plus")
+                       ),
+                       uiOutput("error")
+                     )
+                   ))
+        ))
+      }
+    })
+    
+    output$arima_vis <- renderUI({
+      return(fluidRow(
+        panel(
+          heading = "Time series forecast",
+          status = "info",
+          plotOutput("arima")
+        )
+      ))
+    })
+    
+    output$arima_diag <- renderUI({
+      return(fluidRow(
+        panel(
+          heading = "ARIMA model diagnostics",
+          status = "info",
+          plotOutput("arima_diagnostic")
+        )
+      ))
+    })
+    
+    output$arima <- renderPlot({
+      df <- get_data()
+      series <-
+        ts(df[df$color == "black", input$price_type], frequency = 5)
+      model <- auto.arima(series)
+      plot(forecast(model, h = 30))
+    })
+    
+    output$arima_diagnostic <- renderPlot({
+      df <- get_data()
+      series <-
+        ts(df[df$color == "black", input$price_type], frequency = 5)
+      model <- auto.arima(series)
+      plot(model)
+    })
+  }
+)
+
+```

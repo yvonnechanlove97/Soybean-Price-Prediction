@@ -1,0 +1,394 @@
+---
+title: "EDA_Export_report"
+author: "Do Hyun Hwang"
+date: "October 17, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+Loading the Export Data
+```{r, warning= FALSE}
+library(janitor)
+library(lubridate)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(gridExtra)
+library(ggpubr)
+library(tidyr)
+
+```
+
+
+Removing empty columns and rows
+```{r}
+df_export= read.csv("ExportSalesDataByCommodity(Soybeans).csv", 
+                    na.string = "",
+                    skip = 4,
+                    stringsAsFactors = FALSE,
+                    header = FALSE)
+
+
+df_export = remove_empty(df_export, which = c("rows"))
+df_export = remove_empty(df_export, which = c("cols"))
+#head(df_export)
+```
+
+Removing column  `V3` since it doesn't contain anything useful
+```{r}
+#unique(df_export$V3[which(is.na(df_export$V3) == 0)])
+df_export$V3 = NULL
+
+```
+
+Correcting column names and dropping `Unit Desc` which contains only one unique element (Metric Ton)
+```{r}
+colnames(df_export)[c(1:3,12)] = c(as.matrix(df_export[3,c(1:3,12)]))
+colnames(df_export)[4:5] = apply(as.matrix(df_export[2:3,4:5]), 2, paste, collapse = "_")
+colnames(df_export)[6:11] = apply(as.matrix(df_export[1:3,6:11]), 2, paste, collapse = "_")
+df_export = df_export[-c(1:3),]
+colnames(df_export) = gsub(" ", "_",colnames(df_export))
+df_export$`Unit Desc` = NULL
+
+```
+
+Dropping commas and correcting factors as numerics when applicable
+```{r}
+
+df_export = cbind(df_export[1:3], lapply(df_export[4:11], FUN = function(x) as.numeric(gsub(",","",x))))
+#sum(is.na(df_export))
+#head(df_export)
+df_export$Commodity = NULL
+```
+Reformatting Date
+```{r}
+df_export$Date = mdy(df_export$Date)
+#head(df_export$Date)
+```
+
+A quick summary statement
+```{r}
+#summary(df_export)
+#unique(df_export$Country)
+#cat("\nNon-Zero Entries for UNKNOWN:",sum(df_export$Weekly_Exports[which(df_export$Country == "UNKNOWN")] != 0))
+
+```
+
+Will need to take `KNOWN` and `UNKNOWN` out of the country list.  I believe they show the amount of soybeans sold to `KNOWN` countries and `UNKNOWN` countries.  It seems like we don't have any `UNKNOWN` exports.  We will get rid of these from the country list.  We will also remove `GRAND TOTAL`
+
+```{r}
+rm_unk = which(df_export$Country == "UNKNOWN")
+rm_knw = which(df_export$Country == "KNOWN")
+rm_gt = which(df_export$Country == "GRAND TOTAL")
+df_export = df_export[-c(rm_unk, rm_knw, rm_gt),]
+
+#sum(unique(df_export$Country) == c("UNKNOWN" , "KNOWN", "GRAND TOTAL"))
+```
+
+```{r}
+country_list = unique(df_export$Country)
+sum_export = c()
+
+
+for (country in country_list)
+{
+  ind = which(df_export$Country==country)
+  sum_export = c(sum_export, sum(df_export[ind,]$Weekly_Exports))
+}
+
+df_total_export = data.frame(Country = country_list, Total_Export = sum_export, stringsAsFactors = FALSE)
+
+#We are interested
+competitors = c("ARGENTINA", "BRAZIL")
+top_countries = head(df_total_export[order(df_total_export$Total_Export, decreasing =TRUE),], 8)[,1]
+
+selected_countries=  c(competitors, top_countries)
+```
+
+Segregating `selected_countries` from `df_export`
+```{r}
+ind = c()
+for (country in selected_countries)
+{
+  ind = c(ind,which(df_export$Country == country))
+}
+df_top_export = df_export[ind,] 
+#head(df_top_export)
+```
+
+```{r}
+df_march_price = read_excel("./Data_Undergrad/ActiveSoybeanContractsForMarch2020.CSV.xlsx", skip = 2)
+df_may_price = read_excel("./Data_Undergrad/ActiveSoybeanContractsForMay2020.CSV.xlsx", skip = 2)
+df_july_price = read_excel("./Data_Undergrad/ActiveSoybeanContractsForJuly2020.CSV.xlsx", skip = 2)
+
+df_march_price$Date = ymd(gsub(" UTC", "", df_march_price$Date))
+df_may_price$Date = ymd(gsub(" UTC", "", df_may_price$Date))
+df_july_price$Date = ymd(gsub(" UTC", "", df_july_price$Date))
+
+colnames(df_march_price)[2:5] = paste0("March_",colnames(df_march_price)[2:5])
+colnames(df_may_price)[2:5] = paste0("May_",colnames(df_may_price)[2:5])
+colnames(df_july_price)[2:5] = paste0("July_",colnames(df_july_price)[2:5])
+
+df_price = inner_join(df_july_price, df_march_price, by = "Date")
+df_price = inner_join(df_price, df_may_price, by = "Date")
+
+df_price_close = df_price[,c(1,grep("Close",colnames(df_price)))]
+df_price_close$Date = ymd(df_price_close$Date)
+write.csv(df_price_close, "Daily_Closing_Price.csv", row.names = F)
+```
+
+
+```{r}
+df_top_export = inner_join(df_top_export, df_march_price, by = "Date")
+df_top_export = inner_join(df_top_export, df_may_price, by = "Date")
+df_top_export = inner_join(df_top_export, df_july_price, by = "Date")
+```
+
+```{r}
+
+create_corr_plot = function(independent_var_names, dependent_var_names, selected_countries, df, top_corr = 4)
+{
+  list_top_corr = list()
+  list_corr_mat = list()
+  col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+  
+  independent_var = independent_var_names
+  dependent_var = dependent_var_names
+  for (j in selected_countries)
+  {
+    corr_mat = cor(x = df[df$Country == j, independent_var],
+                   y = df[df$Country == j, dependent_var],
+                   method = "pearson")
+    df_corr = as.data.frame(as.table(corr_mat))
+    df_ab_corr = df_corr[order(df_corr$Freq, decreasing = TRUE),]
+    
+    list_top_corr[[paste0("top_corr_",j)]] = head(df_ab_corr, top_corr)
+    list_corr_mat[[paste0("corr_mat_",j)]] = corr_mat
+    corrplot(list_corr_mat[[paste0("corr_mat_",j)]],
+         tl.cex = .6, 
+         method = "color", 
+         addCoef.col = "black", 
+         title = j,
+         mar=c(0,0,1,0))
+  }
+  return_list = append(list_top_corr, list_corr_mat)
+  return (return_list)
+  
+}
+
+
+```
+
+
+
+
+```{r}
+
+diff_price = function(df_top_export, df_contract_price, prev = TRUE)
+{
+  price_diff = c()
+  dates = unique(df_top_export$Date)
+  
+  for(i in 1:length(dates))
+  {
+    i = dates[i]
+    ind = which(df_contract_price$Date == i)
+    today_row = df_contract_price[ind,]
+    yesterday_row = df_contract_price[ind-1,]
+    tomorrow_row = df_contract_price[ind+1,]
+    
+    if (prev == TRUE){
+      day_diff = today_row - yesterday_row
+      title = "Prev_Comp_"
+    }else{
+      day_diff = tomorrow_row - today_row
+      title = "Next_Comp_"
+    }
+    
+    day_diff$Date = today_row$Date
+    price_diff = rbind(price_diff, day_diff)
+  }
+  colnames(price_diff)[2:5] = paste0(title,colnames(price_diff)[2:5])
+  return(price_diff)
+}
+
+diff_var = function(df_top_export, prev = TRUE)
+{
+  var_diff = c()
+  #Order by Country then date
+  df_top_export = df_top_export[order(df_top_export$Country,df_top_export$Date),]
+  df_top_export = df_top_export[,1:(ncol(df_top_export)-12)]
+  country_names = unique(df_top_export$Country)
+  
+  start = 1
+  if(prev == TRUE){
+    start = 2
+    title = "Prev_Comp_"
+  }
+  
+  for (country in country_names)
+  {
+    i = (df_top_export$Country == country)
+    df_country = df_top_export[i,]
+    
+    end = nrow(df_country)
+    if(prev == FALSE){
+      end = end-1
+      title = "Next_Comp_"
+    }
+    
+    for(j in start:end)
+    {
+      today = df_country[j,3:ncol(df_country)]
+      if(prev == TRUE){
+        yesterday = df_country[j-1,3:ncol(df_country)]
+        day_diff = today - yesterday
+      }else{
+        tomorrow = df_country[+1,3:ncol(df_country)]
+        day_diff = tomorrow - today
+      }
+      day_diff = cbind(df_country[j,1:2], day_diff)
+      var_diff = rbind(var_diff, day_diff)
+    }
+  }
+  colnames(var_diff)[3:ncol(var_diff)]= paste0(title, colnames(var_diff)[3:ncol(var_diff)])
+  return(var_diff)
+}
+
+
+```
+
+```{r}
+
+df_march_prev = diff_price(df_top_export, df_march_price, prev = TRUE)
+df_may_prev = diff_price(df_top_export, df_may_price, prev = TRUE)
+df_july_prev = diff_price(df_top_export, df_july_price, prev = TRUE)
+
+df_march_next = diff_price(df_top_export, df_march_price, prev = FALSE)
+df_may_next = diff_price(df_top_export, df_may_price, prev = FALSE)
+df_july_next = diff_price(df_top_export, df_july_price, prev = FALSE)
+
+df_diff_var_prev = diff_var(df_top_export, prev = TRUE)
+df_diff_var_next = diff_var(df_top_export, prev = FALSE)
+
+```
+
+```{r}
+df_prev_price = inner_join(df_march_prev, df_may_prev, by = "Date")
+df_prev_price = inner_join(df_prev_price, df_july_prev, by = "Date")
+
+df_next_price = inner_join(df_march_next, df_may_next, by = "Date")
+df_next_price = inner_join(df_next_price, df_july_next, by = "Date")
+
+df_prev = inner_join(df_diff_var_prev, df_prev_price, by = "Date")
+df_next = inner_join(df_diff_var_next, df_next_price, by = "Date")
+```
+
+```{r}
+#variable to price
+
+ind_col=c("Weekly_Exports", "CMY_Outstanding_Sales", "CMY_Gross_New_Sales", "CMY_Net_Sales" ,"CMY_Total_Commitment")
+corr_mat_weekly = create_corr_plot(independent_var_names = ind_col, 
+                  dependent_var_names = colnames(df_top_export)[grep("Close",colnames(df_top_export))], 
+                  selected_countries = selected_countries, 
+                  df = df_top_export, top_corr = 4)
+
+
+```
+
+
+```{r}
+#delta variable to delta price (today vs yesterday)
+prev_top_corr= create_corr_plot(independent_var_names = colnames(df_prev[3:10]),
+                 dependent_var_names = colnames(df_prev[11:22]), 
+                 selected_countries = selected_countries,
+                 df = df_prev,
+                 top_corr = 4)
+```
+
+```{r}
+#delta variable to delta price (today vs tomorrow)
+next_top_corr= create_corr_plot(independent_var_names = colnames(df_next[3:10]),
+                 dependent_var_names = colnames(df_next[11:22]), 
+                 selected_countries = selected_countries,
+                 df = df_next,
+                 top_corr = 4)
+
+```
+
+```{r}
+df_var_delta_price_prev = inner_join(df_top_export, df_prev_price, by = "Date")
+df_var_delta_price_next = inner_join(df_top_export, df_next_price, by = "Date")
+
+
+corr_var_delta_price_prev= create_corr_plot(independent_var_names = colnames(df_var_delta_price_prev[3:10]),
+                 dependent_var_names = colnames(df_var_delta_price_prev[23:34]), 
+                 selected_countries = selected_countries,
+                 df = df_var_delta_price_prev,
+                 top_corr = 4)
+
+```
+```{r}
+#variable to delta price next day (today vs tomorrow)
+corr_var_delta_price_next= create_corr_plot(independent_var_names = colnames(df_var_delta_price_next[3:10]),
+                 dependent_var_names = colnames(df_var_delta_price_next[23:34]), 
+                 selected_countries = selected_countries,
+                 df = df_var_delta_price_next,
+                 top_corr = 4)
+
+```
+
+```{r}
+#plot( x = df_top_export[df_top_export$Country ==  "CHINA, PEOPLES REPUBLIC OF",]$Date, y = df_top_export[df_top_export$Country ==  "CHINA, PEOPLES REPUBLIC OF",]$CMY_Total_Commitment, type = 'l')
+#par(new = T)
+plot( x = df_price$Date, df_price$July_Close, col = 'red', type = 'l')
+#Trump unveils plans for 25% tariffs on about $50 billion of Chinese imports.
+abline(v = ymd('2018-04-04'), col ="Blue")
+
+#The United States sets an effective date of July 6 for 25% levies on $34 billion of Chinese imports. It says 25% tariffs will also #kick in on an additional $16 billion of goods after a public comment period. China responds in kind with tariffs on $34 billion of #U.S. goods.
+abline(v = ymd('2018-06-15'), col = "Blue")
+
+#The United States unveils plans for 10% tariffs on $200 billion of Chinese imports.
+abline(v = ymd('2018-07-10'), col = "Blue")
+
+#US and Chinese negotiators continue trade talks in Washington from Wednesday, April 3 to Friday, April 5, a week after holding negotiations in Beijing. On Thursday, April 4, Trump meets with Liu He, and says that the two sides will know "over the next four weeks" whether they can strike a deal. US and Chinese negotiators agree to continue talks the following week.
+abline(v = ymd('2019-04-5'), col = "Red")
+
+#US increases tariffs on US$200 billion worth of Chinese goods (List 3) from 10 percent to 25 percent, as the US and China fail to reach a deal following the end of the first day of the eleventh round of high-level trade talks. The tariff increase will be effective from May 10, 2019 at 12:01 am (EST), with goods leaving from China to the US before midnight still taxed at the previous 10 percent rate. (See full notice here). In response, China's Ministry of Commerce releases a statement announcing that it "deeply regrets" the tariffs and that "necessary countermeasures" will be taken.
+abline(v = ymd('2019-05-10'), col = "Blue")
+```
+
+This part is for regression
+
+```{r}
+#wanted_column = c("Date", "Country",ind_col)
+wanted_column = c("Date", "Country", "Weekly_Exports", "CMY_Outstanding_Sales", "CMY_Total_Commitment")
+
+df = inner_join(df_export[which(df_export$Country %in% top_countries), wanted_column], 
+                df_price_close, by = "Date")
+write.csv(df,"Weekly_Export_With_Price.csv", row.names = FALSE)
+```
+
+```{r}
+
+df_top_export_x = df_top_export[which(df_top_export$Country %in% top_countries), 
+                                wanted_column]
+
+r_temp = reshape(df_top_export_x, idvar = "Date", timevar = "Country", direction = "wide")
+r_temp[is.na(r_temp)] =0
+
+df_top_export_wide = inner_join(r_temp, df_price_close, by = "Date")
+write.csv(df_top_export_wide, "Weekly_Export_With_Price_Wide.csv", row.names = FALSE)
+
+
+```
+
+
+
+
+
