@@ -1,7 +1,5 @@
 ---
 title: "EDA_Export_report"
-author: "Do Hyun Hwang"
-date: "October 17, 2019"
 output: html_document
 ---
 
